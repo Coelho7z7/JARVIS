@@ -31,7 +31,7 @@ ARQUIVO_MEMORIA = "jarvis_memoria.json"
 ARQUIVO_LOG = "jarvis_log.txt"
 PALAVRA_ATIVACAO = "claude"
 
-# Wake word local (detecção roda no PC, sem nuvem)
+# Wake word local (detecção roda no PC, sem precisar da nuvem)
 ARQUIVO_MODELO_WAKE_WORD = "claude.onnx"  # gerado no treino, ver instruções
 LIMIAR_WAKE_WORD = 0.5  # quanto menor, mais sensível (e mais falso positivo)
 TAXA_AMOSTRAGEM = 16000
@@ -83,7 +83,7 @@ def salvar_memoria(memoria):
 
 memoria_fatos = carregar_memoria()
 
-# ---------- Programas que o JARVIS pode abrir/fechar ----------
+# Programas que o JARVIS pode abrir/fechar 
 COMANDOS = {
     "brave": r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
     "steam": r"C:\Program Files (x86)\Steam\steam.exe",
