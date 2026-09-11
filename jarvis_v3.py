@@ -1,89 +1,135 @@
+"""
+JARVIS - Assistente pessoal por voz (v4)
+=========================================
 
-import speech_recognition as sr
-import subprocess
-import os
-import json
-import threading
-import queue
-import logging
-import webbrowser
-import datetime
+Principais mudanças em relação às versões anteriores:
+
+1. Áudio num único stream contínuo. A wake word e a captura do comando
+   usam o MESMO stream do início ao fim — nunca fecha e reabre o
+   microfone. Isso elimina os cliques/ecos que causavam disparos
+   duplicados da wake word logo depois de um comando.
+
+2. Transcrição local com faster-whisper, no lugar do Google Speech
+   Recognition gratuito. Roda offline (não depende da internet nem de
+   limite de uso de uma API de terceiros) e é bem mais preciso em
+   português. Tenta usar a GPU (RTX 3050); se não conseguir, cai pra CPU
+   sozinho, sem travar o programa.
+
+3. Rota rápida sem LLM. Comandos comuns e inequívocos (abrir/fechar
+   programa, hora, volume) são resolvidos na hora, sem esperar o Ollama
+   pensar. O LLM só é chamado pra conversa livre ou pedidos ambíguos.
+
+4. Recuperação automática de erros. Um erro pontual (glitch de áudio,
+   Ollama fora do ar, falha na transcrição) não derruba a thread de
+   escuta pro resto da sessão — ela loga o problema e continua.
+"""
+
+from __future__ import annotations
+
 import asyncio
+import datetime
+import difflib
+import json
+import logging
+import os
+import queue
+import re
+import subprocess
+import sys
+import threading
+import time
+import unicodedata
+import webbrowser
+from ctypes import POINTER, cast
+
+# No Windows, o faster-whisper (via CTranslate2) procura as DLLs de CUDA
+# (cuBLAS, cuDNN, CUDA Runtime) nas pastas do sistema/PATH. Quando elas
+# vêm instaladas via pip (pacotes nvidia-*-cu12) em vez do CUDA Toolkit
+# completo, ficam dentro do site-packages e o Windows não acha sozinho —
+# por isso registramos essas pastas aqui, ANTES de importar qualquer
+# coisa que dependa delas. Usamos os.add_dll_directory() (mecanismo
+# moderno) E o PATH clássico (mais universalmente respeitado por
+# bibliotecas C++ compiladas), pra cobrir os dois casos.
+if sys.platform == "win32":
+    import glob
+    import site
+
+    _dll_dirs = []
+    for _base in site.getsitepackages():
+        _dll_dirs.extend(glob.glob(os.path.join(_base, "nvidia", "*", "bin")))
+
+    for _caminho_dll in _dll_dirs:
+        os.add_dll_directory(_caminho_dll)
+
+    if _dll_dirs:
+        os.environ["PATH"] = os.pathsep.join(_dll_dirs) + os.pathsep + os.environ.get("PATH", "")
+        print(f"[JARVIS] Pastas de DLL da NVIDIA registradas: {_dll_dirs}")
+    else:
+        print("[JARVIS] Nenhuma pasta de DLL da NVIDIA encontrada em site-packages (GPU provavelmente vai cair pra CPU).")
+
+import edge_tts
+import numpy as np
 import ollama
 import psutil
-import edge_tts
+import pyaudio
 import pygame
 import pystray
-import pyaudio
-import numpy as np
+from comtypes import CLSCTX_ALL
+from faster_whisper import WhisperModel
 from openwakeword.model import Model as WakeWordModel
 from PIL import Image, ImageDraw
 from plyer import notification
-
-from ctypes import cast, POINTER
-from comtypes import CLSCTX_ALL
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 
-MODELO_LLM = "llama3.2"
-VOZ_TTS = "pt-BR-AntonioNeural"
+# ======================================================================
+# Configuração
+# ======================================================================
+
+# --- Arquivos ---
 ARQUIVO_AUDIO_TEMP = "jarvis_fala.mp3"
 ARQUIVO_MEMORIA = "jarvis_memoria.json"
 ARQUIVO_LOG = "jarvis_log.txt"
-PALAVRA_ATIVACAO = "claude"
 
-# Wake word local (detecção roda no PC, sem precisar da nuvem)
-ARQUIVO_MODELO_WAKE_WORD = "claude.onnx"  # gerado no treino, ver instruções
-LIMIAR_WAKE_WORD = 0.5  # quanto menor, mais sensível (e mais falso positivo)
+# --- LLM (Ollama) ---
+MODELO_LLM = "llama3.2"
+OLLAMA_KEEP_ALIVE = "10m"  # mantém o modelo carregado na memória por mais tempo
+MAX_FATOS_MEMORIA = 20
+
+# --- Voz (TTS) ---
+VOZ_TTS = "pt-BR-AntonioNeural"
+
+# --- Wake word ---
+PALAVRA_ATIVACAO = "hey jarvis"
+ARQUIVO_MODELO_WAKE_WORD = "hey_jarvis"  # modelo pré-treinado do openWakeWord
+LIMIAR_WAKE_WORD = 0.5
+FRAMES_CONSECUTIVOS_PARA_CONFIRMAR = 2  # exige 2 chunks (~160ms) seguidos acima do limiar
+COOLDOWN_APOS_FALA_SEGUNDOS = 0.6  # margem de segurança após o JARVIS terminar de falar
+
+# --- Áudio ---
 TAXA_AMOSTRAGEM = 16000
-TAMANHO_CHUNK = 1280  # ~80ms de áudio por vez, é o que o openWakeWord espera
+TAMANHO_CHUNK = 1280  # ~80ms, é o que o openWakeWord espera
+SEGUNDOS_CALIBRACAO_RUIDO = 1.0
+FATOR_LIMIAR_SILENCIO = 2.5  # múltiplo do ruído ambiente pra considerar "silêncio"
+PISO_LIMIAR_SILENCIO = 150.0  # nunca considera silêncio abaixo disso (RMS bruto)
+SILENCIO_PARA_ENCERRAR_SEGUNDOS = 1.0
+DURACAO_MINIMA_COMANDO_SEGUNDOS = 0.3
+DURACAO_MAXIMA_COMANDO_SEGUNDOS = 8.0
+
+# --- STT (faster-whisper) ---
+TAMANHO_MODELO_STT = "small"  # tiny/base/small/medium — maior = mais preciso e mais lento
+IDIOMA_STT = "pt"
+
+# --- Ações ---
 ACOES_DESTRUTIVAS = {"desligar_pc", "reiniciar_pc"}
 PALAVRAS_CONFIRMACAO = {"sim", "confirmo", "confirmado", "pode", "isso"}
-MAX_FATOS_MEMORIA = 20
+PALAVRAS_SAIDA = {"parar", "encerrar", "sair", "desligar o jarvis"}
 
 PALAVRAS_CHAVE_DESTRUTIVAS = {
     "desligar_pc": [("desliga", "computador"), ("desliga", "pc"), ("desligar", "computador"), ("desligar", "pc")],
     "reiniciar_pc": [("reinicia", "computador"), ("reinicia", "pc"), ("reiniciar", "computador"), ("reiniciar", "pc")],
 }
 
-
-def frase_bate_com_acao_destrutiva(nome_acao, frase_original):
-    """Segunda checagem, baseada em regra fixa (não em LLM), antes de
-    aceitar uma ação destrutiva. Reduz falso positivo por alucinação do
-    modelo — se a frase falada nem menciona as palavras esperadas, a
-    ação é barrada mesmo que o LLM tenha decidido executá-la."""
-    combinacoes = PALAVRAS_CHAVE_DESTRUTIVAS.get(nome_acao, [])
-    return any(p1 in frase_original and p2 in frase_original for p1, p2 in combinacoes)
-
-# Log de ações
-logging.basicConfig(
-    filename=ARQUIVO_LOG,
-    level=logging.INFO,
-    format="%(asctime)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-
-
-def registrar_log(mensagem):
-    logging.info(mensagem)
-
-
-# Memória persistente
-
-def carregar_memoria():
-    if not os.path.exists(ARQUIVO_MEMORIA):
-        return []
-    with open(ARQUIVO_MEMORIA, "r", encoding="utf-8") as arquivo:
-        return json.load(arquivo)
-
-
-def salvar_memoria(memoria):
-    with open(ARQUIVO_MEMORIA, "w", encoding="utf-8") as arquivo:
-        json.dump(memoria, arquivo, ensure_ascii=False, indent=2)
-
-
-memoria_fatos = carregar_memoria()
-
-# Programas que o JARVIS pode abrir/fechar 
+# Programas que o JARVIS pode abrir/fechar
 COMANDOS = {
     "brave": r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
     "steam": r"C:\Program Files (x86)\Steam\steam.exe",
@@ -103,8 +149,6 @@ PROCESSOS = {
     "spotify": "Spotify.exe",
 }
 
-PALAVRAS_SAIDA = {"parar", "encerrar", "sair", "desligar o jarvis"}
-
 ACOES_DISPONIVEIS = """
 - abrir_programa: {"programa": "<um destes: %s>"}
 - fechar_programa: {"programa": "<um destes: %s>"}
@@ -119,7 +163,75 @@ ACOES_DISPONIVEIS = """
 """ % (list(COMANDOS.keys()), list(COMANDOS.keys()))
 
 
-def montar_prompt_sistema():
+# ======================================================================
+# Logging
+# ======================================================================
+# Um único logger pra tudo: grava no arquivo (nível INFO+, sem poluir com
+# detalhe de diagnóstico) e mostra no terminal em tempo real (nível DEBUG+,
+# útil pra acompanhar o que está acontecendo enquanto testa).
+
+logger = logging.getLogger("jarvis")
+logger.setLevel(logging.DEBUG)
+
+_handler_arquivo = logging.FileHandler(ARQUIVO_LOG, encoding="utf-8")
+_handler_arquivo.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+_handler_arquivo.setLevel(logging.INFO)
+
+_handler_console = logging.StreamHandler()
+_handler_console.setFormatter(logging.Formatter("[JARVIS] %(message)s"))
+_handler_console.setLevel(logging.DEBUG)
+
+logger.addHandler(_handler_arquivo)
+logger.addHandler(_handler_console)
+
+
+# ======================================================================
+# Estado compartilhado entre a thread de escuta e o loop principal
+# ======================================================================
+
+class EstadoAssistente:
+    """Tudo que a thread de escuta e o loop principal precisam combinar
+    entre si. Concentrar isso numa classe evita ficar passando meia dúzia
+    de parâmetros soltos pra cada função."""
+
+    def __init__(self) -> None:
+        self.fila_comandos: queue.Queue[str] = queue.Queue()
+        self.parar = threading.Event()
+        self.falando = threading.Event()
+        # Ativado quando o loop principal precisa de UMA captura direta,
+        # sem exigir a wake word de novo — usado tanto pro "Diga." (quando
+        # a wake word disparou mas nada foi entendido) quanto pra esperar
+        # a confirmação de uma ação destrutiva.
+        self.escuta_direta = threading.Event()
+        self.historico: list[dict] = []
+
+
+# Referência global pro estado, usada só pelo callback assíncrono dos
+# lembretes (threading.Timer), que dispara fora do loop principal e por
+# isso não recebe o estado como parâmetro normalmente.
+_estado_global: EstadoAssistente | None = None
+
+
+# ======================================================================
+# Memória persistente (fatos sobre o usuário)
+# ======================================================================
+
+def carregar_memoria() -> list[str]:
+    if not os.path.exists(ARQUIVO_MEMORIA):
+        return []
+    with open(ARQUIVO_MEMORIA, "r", encoding="utf-8") as arquivo:
+        return json.load(arquivo)
+
+
+def salvar_memoria(memoria: list[str]) -> None:
+    with open(ARQUIVO_MEMORIA, "w", encoding="utf-8") as arquivo:
+        json.dump(memoria, arquivo, ensure_ascii=False, indent=2)
+
+
+memoria_fatos: list[str] = carregar_memoria()
+
+
+def montar_prompt_sistema() -> str:
     fatos = "\n".join(f"- {fato}" for fato in memoria_fatos) or "(nada ainda)"
     return f"""Você é JARVIS, um assistente pessoal por voz, direto e educado.
 Você SEMPRE responde em JSON puro, sem texto fora do JSON, no formato:
@@ -156,9 +268,40 @@ de forma clara e explícita.
 """
 
 
-# Execução de cada ação-
+def frase_bate_com_acao_destrutiva(nome_acao: str, frase_original: str) -> bool:
+    """Segunda checagem, baseada em regra fixa (não em LLM), antes de
+    aceitar uma ação destrutiva. Reduz falso positivo por alucinação do
+    modelo — se a frase falada nem menciona as palavras esperadas, a
+    ação é barrada mesmo que o LLM tenha decidido executá-la."""
+    combinacoes = PALAVRAS_CHAVE_DESTRUTIVAS.get(nome_acao, [])
+    return any(p1 in frase_original and p2 in frase_original for p1, p2 in combinacoes)
 
-def abrir_programa(programa, **_):
+
+# ======================================================================
+# Execução de cada ação
+# ======================================================================
+
+def _resolver_programa(texto: str) -> str | None:
+    """Casa um texto reconhecido por voz (que pode vir com pequenos erros
+    de transcrição) com uma chave conhecida em COMANDOS, usando
+    correspondência aproximada. Retorna None se não achar nada parecido
+    o suficiente."""
+    texto = normalizar(texto).strip().replace(" ", "_")
+    if not texto:
+        return None
+    if texto in COMANDOS:
+        return texto
+    for chave in COMANDOS:
+        if chave in texto or texto in chave:
+            return chave
+    for token in texto.split("_"):
+        candidatos = difflib.get_close_matches(token, COMANDOS.keys(), n=1, cutoff=0.6)
+        if candidatos:
+            return candidatos[0]
+    return None
+
+
+def abrir_programa(programa: str, **_) -> bool:
     caminho = COMANDOS.get(programa)
     if not caminho:
         return False
@@ -173,7 +316,7 @@ def abrir_programa(programa, **_):
         return False
 
 
-def fechar_programa(programa, **_):
+def fechar_programa(programa: str, **_) -> bool:
     nome_processo = PROCESSOS.get(programa)
     if not nome_processo:
         return False
@@ -185,7 +328,7 @@ def fechar_programa(programa, **_):
     return encontrou
 
 
-def pesquisar_web(termo, **_):
+def pesquisar_web(termo: str, **_) -> bool:
     url = f"https://www.google.com/search?q={termo.replace(' ', '+')}"
     webbrowser.open(url)
     return True
@@ -197,7 +340,7 @@ def _pegar_volume_endpoint():
     return cast(interface, POINTER(IAudioEndpointVolume))
 
 
-def controlar_volume(tipo, **_):
+def controlar_volume(tipo: str, **_) -> bool:
     volume = _pegar_volume_endpoint()
     if tipo == "mudo":
         volume.SetMute(1, None)
@@ -211,39 +354,39 @@ def controlar_volume(tipo, **_):
     return True
 
 
-def dizer_hora(**_):
+def dizer_hora(**_) -> str:
     agora = datetime.datetime.now()
     return agora.strftime("Agora são %H:%M de %d/%m/%Y")
 
 
-def desligar_pc(**_):
+def desligar_pc(**_) -> bool:
     subprocess.Popen(["shutdown", "/s", "/t", "0"])
     return True
 
 
-def reiniciar_pc(**_):
+def reiniciar_pc(**_) -> bool:
     subprocess.Popen(["shutdown", "/r", "/t", "0"])
     return True
 
 
-def criar_lembrete(minutos, mensagem, **_):
+def criar_lembrete(minutos: float, mensagem: str, **_) -> bool:
     segundos = float(minutos) * 60
 
     def avisar():
-        falar(f"Lembrete: {mensagem}")
+        falar(f"Lembrete: {mensagem}", estado=_estado_global)
 
     threading.Timer(segundos, avisar).start()
     return True
 
 
-def lembrar_fato(fato, **_):
+def lembrar_fato(fato: str, **_) -> bool:
     memoria_fatos.append(fato)
     _condensar_memoria_se_necessario()
     salvar_memoria(memoria_fatos)
     return True
 
 
-def _condensar_memoria_se_necessario():
+def _condensar_memoria_se_necessario() -> None:
     """Isso NÃO é a IA 'aprendendo' de verdade — é só compressão de texto.
     Sem isso, a lista de fatos cresceria pra sempre, deixando o prompt do
     LLM cada vez maior, mais lento e mais caro de processar."""
@@ -265,14 +408,15 @@ def _condensar_memoria_se_necessario():
                     "sem perder nenhuma informação importante:\n" + texto_antigos
                 ),
             }],
+            keep_alive=OLLAMA_KEEP_ALIVE,
         )
         resumo = resposta["message"]["content"].strip()
     except Exception as erro:
-        registrar_log(f"Falha ao condensar memória: {erro}")
+        logger.error(f"Falha ao condensar memória: {erro}")
         resumo = "; ".join(fatos_antigos)  # não perde a informação mesmo se o resumo falhar
 
     memoria_fatos = [f"(resumo de fatos antigos) {resumo}"] + fatos_recentes
-    registrar_log(f"Memória condensada: {len(fatos_antigos)} fatos antigos viraram 1 resumo.")
+    logger.info(f"Memória condensada: {len(fatos_antigos)} fatos antigos viraram 1 resumo.")
 
 
 EXECUTORES = {
@@ -287,65 +431,11 @@ EXECUTORES = {
 }
 
 
-# Voz 
-
-async def _gerar_audio(texto):
-    comunicador = edge_tts.Communicate(texto, voice=VOZ_TTS)
-    await comunicador.save(ARQUIVO_AUDIO_TEMP)
-
-
-def falar(texto, fila_interrupcao=None):
-    """Fala o texto. Se `fila_interrupcao` receber algo enquanto fala,
-    para na hora (permite interromper com 'claude' de novo)."""
-    print(f"[JARVIS] {texto}")
-
-    notification.notify(title="JARVIS", message=texto, timeout=5, app_name="JARVIS")
-
-    asyncio.run(_gerar_audio(texto))
-
-    pygame.mixer.music.load(ARQUIVO_AUDIO_TEMP)
-    pygame.mixer.music.play()
-    while pygame.mixer.music.get_busy():
-        if fila_interrupcao is not None and not fila_interrupcao.empty():
-            pygame.mixer.music.stop()
-            break
-        pygame.time.wait(100)
-
-    pygame.mixer.music.unload()
-    os.remove(ARQUIVO_AUDIO_TEMP)
-
-
-# Cérebro (LLM) 
-
-def perguntar_ao_cerebro(texto_usuario, historico, tentativas=2):
-    historico.append({"role": "user", "content": texto_usuario})
-
-    for tentativa in range(tentativas):
-        resposta = ollama.chat(
-            model=MODELO_LLM,
-            messages=[{"role": "system", "content": montar_prompt_sistema()}] + historico,
-            format="json",
-            options={"temperature": 0},  # menos "criatividade", mais consistência na decisão
-        )
-        conteudo = resposta["message"]["content"]
-
-        try:
-            decisao = json.loads(conteudo)
-            historico.append({"role": "assistant", "content": conteudo})
-            return decisao
-        except json.JSONDecodeError:
-            registrar_log(f"JSON inválido do LLM (tentativa {tentativa + 1}): {conteudo}")
-            # pede de novo, reforçando o formato
-            historico.append({"role": "user", "content": "Responda APENAS o JSON válido, sem mais nada."})
-
-    return {"acao": "conversar", "parametros": {}, "resposta": "Não entendi direito, pode repetir?"}
-
-
-def executar_acao(decisao):
+def executar_acao(decisao: dict) -> str | None:
     nome_acao = decisao.get("acao")
     parametros = decisao.get("parametros", {}) or {}
 
-    registrar_log(f"Ação decidida: {nome_acao} | parâmetros: {parametros}")
+    logger.info(f"Ação decidida: {nome_acao} | parâmetros: {parametros}")
 
     if nome_acao == "dizer_hora":
         return dizer_hora()
@@ -357,35 +447,250 @@ def executar_acao(decisao):
     try:
         sucesso = funcao(**parametros)
         resultado = None if sucesso else f"Não consegui completar a ação {nome_acao}."
-        registrar_log(f"Resultado de {nome_acao}: {'sucesso' if sucesso else 'falhou'}")
+        logger.info(f"Resultado de {nome_acao}: {'sucesso' if sucesso else 'falhou'}")
         return resultado
     except Exception as erro:
-        registrar_log(f"Erro em {nome_acao}: {erro}")
+        logger.error(f"Erro em {nome_acao}: {erro}")
         return f"Deu erro tentando fazer isso: {erro}"
 
 
-# Escuta em thread separada 
+# ======================================================================
+# Rota rápida — resolve comandos comuns sem chamar o LLM
+# ======================================================================
+# Cobre só o que dá pra reconhecer com confiança; qualquer coisa ambígua
+# ou fora desse conjunto cai pro LLM normalmente. O ganho é velocidade:
+# essas respostas saem quase na hora, sem esperar o Ollama gerar nada.
 
-def _captar_comando_google():
-    """Só é chamado DEPOIS que a wake word já disparou localmente — ou seja,
-    a nuvem só recebe áudio quando o usuário realmente chamou o JARVIS."""
-    reconhecedor = sr.Recognizer()
-    with sr.Microphone() as fonte:
-        reconhecedor.adjust_for_ambient_noise(fonte, duration=0.5)
+_PADRAO_ABRIR = re.compile(r"\b(?:abre|abrir|abra)\b\s+(?:o|a)?\s*([a-z0-9_ ]+)")
+_PADRAO_FECHAR = re.compile(r"\b(?:fecha|fechar|feche)\b\s+(?:o|a)?\s*([a-z0-9_ ]+)")
+
+
+def normalizar(texto: str) -> str:
+    """Minúsculas e sem acentuação — facilita casar padrões vindos da
+    transcrição, que pode vir com ou sem pontuação/maiúsculas."""
+    texto = texto.strip().lower()
+    texto = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode("ascii")
+    texto = re.sub(r"[^\w\s]", "", texto)
+    return texto.strip()
+
+
+def tentar_rota_rapida(comando: str) -> dict | None:
+    """Tenta resolver o comando com regras determinísticas. Retorna um
+    dicionário no mesmo formato que o LLM devolveria, ou None se não
+    reconheceu nada (nesse caso, quem chamou deve cair pro LLM)."""
+
+    if "que horas" in comando or "hora e" in comando:
+        return {"acao": "dizer_hora", "parametros": {}, "resposta": ""}
+
+    m = _PADRAO_ABRIR.search(comando)
+    if m:
+        programa = _resolver_programa(m.group(1))
+        if programa:
+            nome_falado = programa.replace("_", " ")
+            return {"acao": "abrir_programa", "parametros": {"programa": programa}, "resposta": f"Abrindo o {nome_falado}."}
+
+    m = _PADRAO_FECHAR.search(comando)
+    if m:
+        programa = _resolver_programa(m.group(1))
+        if programa:
+            nome_falado = programa.replace("_", " ")
+            return {"acao": "fechar_programa", "parametros": {"programa": programa}, "resposta": f"Fechando o {nome_falado}."}
+
+    if "aumenta" in comando and "volume" in comando:
+        return {"acao": "controlar_volume", "parametros": {"tipo": "aumentar"}, "resposta": "Aumentando o volume."}
+    if ("diminui" in comando or "abaixa" in comando) and "volume" in comando:
+        return {"acao": "controlar_volume", "parametros": {"tipo": "diminuir"}, "resposta": "Diminuindo o volume."}
+    if "mudo" in comando or "silencia" in comando:
+        return {"acao": "controlar_volume", "parametros": {"tipo": "mudo"}, "resposta": "Deixando no mudo."}
+
+    return None
+
+
+# ======================================================================
+# Voz (TTS)
+# ======================================================================
+
+async def _gerar_audio(texto: str) -> None:
+    comunicador = edge_tts.Communicate(texto, voice=VOZ_TTS)
+    await comunicador.save(ARQUIVO_AUDIO_TEMP)
+
+
+def falar(texto: str, estado: EstadoAssistente | None = None) -> None:
+    """Sintetiza e reproduz `texto` em voz.
+
+    Enquanto fala, marca `estado.falando` (se um estado for passado) —
+    a thread de escuta usa isso pra pausar completamente a avaliação de
+    áudio nesse período, evitando que o JARVIS ouça a própria voz e se
+    autointerrompa."""
+    logger.info(texto)
+
+    try:
+        notification.notify(title="JARVIS", message=texto, timeout=5, app_name="JARVIS")
+    except Exception as erro:
+        logger.debug(f"(debug) Notificação do Windows falhou (não é crítico): {erro}")
+
+    if estado is not None:
+        estado.falando.set()
+    try:
+        asyncio.run(_gerar_audio(texto))
+        pygame.mixer.music.load(ARQUIVO_AUDIO_TEMP)
+        pygame.mixer.music.play()
+        while pygame.mixer.music.get_busy():
+            pygame.time.wait(100)
+        pygame.mixer.music.unload()
+        os.remove(ARQUIVO_AUDIO_TEMP)
+    except Exception as erro:
+        logger.error(f"Falha ao gerar/reproduzir a fala: {erro}")
+    finally:
+        if estado is not None:
+            estado.falando.clear()
+
+
+# ======================================================================
+# Cérebro (LLM)
+# ======================================================================
+
+def perguntar_ao_cerebro(texto_usuario: str, historico: list[dict], tentativas: int = 2) -> dict:
+    historico.append({"role": "user", "content": texto_usuario})
+
+    for tentativa in range(tentativas):
         try:
-            audio = reconhecedor.listen(fonte, timeout=5, phrase_time_limit=6)
-            return reconhecedor.recognize_google(audio, language="pt-BR")
-        except (sr.WaitTimeoutError, sr.UnknownValueError, sr.RequestError):
-            return None
+            resposta = ollama.chat(
+                model=MODELO_LLM,
+                messages=[{"role": "system", "content": montar_prompt_sistema()}] + historico,
+                format="json",
+                options={"temperature": 0},  # menos "criatividade", mais consistência na decisão
+                keep_alive=OLLAMA_KEEP_ALIVE,
+            )
+        except Exception as erro:
+            logger.error(f"Não consegui falar com o Ollama: {erro}")
+            return {
+                "acao": "conversar",
+                "parametros": {},
+                "resposta": "Não consegui pensar direito agora, meu cérebro parece estar fora do ar.",
+            }
+
+        conteudo = resposta["message"]["content"]
+        try:
+            decisao = json.loads(conteudo)
+            historico.append({"role": "assistant", "content": conteudo})
+            return decisao
+        except json.JSONDecodeError:
+            logger.warning(f"JSON inválido do LLM (tentativa {tentativa + 1}): {conteudo}")
+            historico.append({"role": "user", "content": "Responda APENAS o JSON válido, sem mais nada."})
+
+    return {"acao": "conversar", "parametros": {}, "resposta": "Não entendi direito, pode repetir?"}
 
 
-def thread_escuta(fila_comandos, parar_evento, estado_confirmacao):
-    """A detecção da wake word roda 100% local (openWakeWord), processando
-    o áudio em pedacinhos de ~80ms direto no seu PC. Só quando o score passa
-    do limiar é que a gente abre o microfone pro reconhecimento por nuvem
-    (Google), pra capturar o comando em si. É essa troca que evita mandar
-    toda fala do ambiente pra internet."""
-    wake_model = WakeWordModel(wakeword_models=[ARQUIVO_MODELO_WAKE_WORD])
+# ======================================================================
+# Transcrição local (faster-whisper)
+# ======================================================================
+
+def _testar_modelo_stt(modelo: WhisperModel) -> None:
+    """Roda uma transcrição mínima logo após carregar o modelo, pra
+    garantir que ele REALMENTE funciona nesse dispositivo. Carregar sem
+    erro não é garantia — problemas como DLL de CUDA faltando só
+    aparecem na hora de uma inferência de verdade, não no carregamento."""
+    audio_silencio = np.zeros(TAXA_AMOSTRAGEM, dtype=np.float32)  # 1s de silêncio
+    segmentos, _info = modelo.transcribe(audio_silencio, language=IDIOMA_STT, beam_size=1)
+    list(segmentos)  # força a geração (é um gerador preguiçoso, sem isso não roda de verdade)
+
+
+def carregar_modelo_stt() -> WhisperModel:
+    """Tenta carregar o modelo na GPU (bem mais rápido) e testa com uma
+    inferência real; se não der certo (driver CUDA ausente, cuDNN/cuBLAS
+    faltando, etc.), cai pra CPU sozinho."""
+    try:
+        modelo = WhisperModel(TAMANHO_MODELO_STT, device="cuda", compute_type="float16")
+        _testar_modelo_stt(modelo)
+        logger.info(f"Modelo de transcrição '{TAMANHO_MODELO_STT}' carregado na GPU.")
+        return modelo
+    except Exception as erro:
+        logger.warning(f"Não consegui usar a GPU pra transcrição ({erro}); usando CPU.")
+        modelo = WhisperModel(TAMANHO_MODELO_STT, device="cpu", compute_type="int8")
+        logger.info(f"Modelo de transcrição '{TAMANHO_MODELO_STT}' carregado na CPU.")
+        return modelo
+
+
+def transcrever(modelo_stt: WhisperModel, audio_int16: np.ndarray) -> str:
+    if audio_int16.size == 0:
+        return ""
+    audio_float = audio_int16.astype(np.float32) / 32768.0
+    segmentos, _info = modelo_stt.transcribe(
+        audio_float,
+        language=IDIOMA_STT,
+        beam_size=1,                     # prioriza velocidade
+        vad_filter=True,                 # o próprio whisper filtra silêncio/ruído residual
+        condition_on_previous_text=False,  # evita repetir/alucinar texto de contexto anterior
+    )
+    return " ".join(segmento.text for segmento in segmentos).strip()
+
+
+# ======================================================================
+# Áudio: calibração de ruído e captura de comando (mesmo stream sempre)
+# ======================================================================
+
+def _rms(amostra: np.ndarray) -> float:
+    return float(np.sqrt(np.mean(amostra.astype(np.float64) ** 2))) if amostra.size else 0.0
+
+
+def _calibrar_ruido_ambiente(stream) -> float:
+    """Mede o ruído de fundo por um instante, pra adaptar o limiar de
+    silêncio usado ao capturar comandos — em vez de um valor fixo que
+    funciona bem num quarto silencioso e mal num ambiente barulhento."""
+    amostras = []
+    n_chunks = max(int(SEGUNDOS_CALIBRACAO_RUIDO * TAXA_AMOSTRAGEM / TAMANHO_CHUNK), 1)
+    for _ in range(n_chunks):
+        chunk = stream.read(TAMANHO_CHUNK, exception_on_overflow=False)
+        amostras.append(np.frombuffer(chunk, dtype=np.int16))
+    rms = _rms(np.concatenate(amostras)) if amostras else 0.0
+    limiar = max(rms * FATOR_LIMIAR_SILENCIO, PISO_LIMIAR_SILENCIO)
+    logger.info(f"Ruído ambiente calibrado (RMS {rms:.0f}); limiar de silêncio definido em {limiar:.0f}.")
+    return limiar
+
+
+def _capturar_comando(stream, limiar_silencio: float) -> np.ndarray:
+    """Grava do MESMO stream já aberto (sem reabrir o microfone) até
+    detectar silêncio suficiente ou atingir o tempo máximo. Usa energia
+    (RMS) pra decidir onde a fala termina, sem depender de nenhum
+    serviço externo pra 'endpointing'."""
+    pedacos = []
+    duracao_chunk = TAMANHO_CHUNK / TAXA_AMOSTRAGEM
+    duracao_total = 0.0
+    duracao_silencio = 0.0
+
+    while duracao_total < DURACAO_MAXIMA_COMANDO_SEGUNDOS:
+        chunk = stream.read(TAMANHO_CHUNK, exception_on_overflow=False)
+        pedacos.append(chunk)
+        duracao_total += duracao_chunk
+
+        rms = _rms(np.frombuffer(chunk, dtype=np.int16))
+        duracao_silencio = duracao_silencio + duracao_chunk if rms < limiar_silencio else 0.0
+
+        if duracao_total >= DURACAO_MINIMA_COMANDO_SEGUNDOS and duracao_silencio >= SILENCIO_PARA_ENCERRAR_SEGUNDOS:
+            break
+
+    return np.frombuffer(b"".join(pedacos), dtype=np.int16)
+
+
+# ======================================================================
+# Thread de escuta
+# ======================================================================
+
+def thread_escuta(estado: EstadoAssistente, modelo_stt: WhisperModel) -> None:
+    """Roda continuamente num único stream de áudio:
+
+    1) avalia a wake word local (openWakeWord) chunk a chunk;
+    2) ao confirmar (alguns chunks seguidos acima do limiar), grava o
+       comando no MESMO stream até detectar silêncio;
+    3) transcreve localmente com faster-whisper e enfileira o texto.
+
+    Fica pausada (sem avaliar nada) enquanto `estado.falando` está
+    ativo, com uma pequena margem de segurança depois que a fala
+    termina — evita autointerrupção e ecos residuais."""
+    wake_model = WakeWordModel(wakeword_models=[ARQUIVO_MODELO_WAKE_WORD], inference_framework="onnx")
+    nome_wake_word = ARQUIVO_MODELO_WAKE_WORD.replace(".onnx", "")
+
     pa = pyaudio.PyAudio()
     stream = pa.open(
         format=pyaudio.paInt16,
@@ -396,127 +701,194 @@ def thread_escuta(fila_comandos, parar_evento, estado_confirmacao):
     )
 
     try:
-        while not parar_evento.is_set():
-            if estado_confirmacao["aguardando"]:
-                # durante uma confirmação (sim/não), escuta direto por nuvem —
-                # é rápido e raro, não vale a pena complicar com wake word aqui
-                resposta = _captar_comando_google()
-                if resposta:
-                    fila_comandos.put(resposta.lower())
-                continue
+        limiar_silencio = _calibrar_ruido_ambiente(stream)
+        frames_altos_consecutivos = 0
+        pausado_ate = 0.0
 
-            chunk = stream.read(TAMANHO_CHUNK, exception_on_overflow=False)
-            chunk_np = np.frombuffer(chunk, dtype=np.int16)
-            predicoes = wake_model.predict(chunk_np)
-            pontuacao = predicoes.get(ARQUIVO_MODELO_WAKE_WORD.replace(".onnx", ""), 0)
+        while not estado.parar.is_set():
+            try:
+                if estado.falando.is_set():
+                    stream.read(TAMANHO_CHUNK, exception_on_overflow=False)
+                    pausado_ate = time.time() + COOLDOWN_APOS_FALA_SEGUNDOS
+                    frames_altos_consecutivos = 0
+                    continue
 
-            if pontuacao > LIMIAR_WAKE_WORD:
-                registrar_log(f"Wake word detectada localmente (score {pontuacao:.2f}).")
-                stream.stop_stream()
-                comando = _captar_comando_google()
-                stream.start_stream()
-                fila_comandos.put((comando or "").lower())
+                if time.time() < pausado_ate:
+                    stream.read(TAMANHO_CHUNK, exception_on_overflow=False)
+                    continue
+
+                if estado.escuta_direta.is_set():
+                    audio = _capturar_comando(stream, limiar_silencio)
+                    texto = normalizar(transcrever(modelo_stt, audio))
+                    logger.debug(f"(debug) Captura direta transcrita: {texto!r}")
+                    if texto:
+                        estado.fila_comandos.put(texto)
+                    continue
+
+                chunk = stream.read(TAMANHO_CHUNK, exception_on_overflow=False)
+                chunk_np = np.frombuffer(chunk, dtype=np.int16)
+                predicoes = wake_model.predict(chunk_np)
+                pontuacao = predicoes.get(nome_wake_word, 0.0)
+
+                frames_altos_consecutivos = frames_altos_consecutivos + 1 if pontuacao > LIMIAR_WAKE_WORD else 0
+
+                if frames_altos_consecutivos >= FRAMES_CONSECUTIVOS_PARA_CONFIRMAR:
+                    frames_altos_consecutivos = 0
+                    logger.debug(f"(debug) Wake word confirmada (score {pontuacao:.2f}). Ouvindo comando...")
+                    audio = _capturar_comando(stream, limiar_silencio)
+                    texto = normalizar(transcrever(modelo_stt, audio))
+                    logger.debug(f"(debug) Comando transcrito: {texto!r}")
+                    # Enfileira mesmo vazio: a wake word REALMENTE disparou,
+                    # então o usuário merece o "Diga." em vez de silêncio.
+                    estado.fila_comandos.put(texto)
+            except Exception as erro:
+                # Nunca deixa a thread morrer por um erro pontual — loga e
+                # continua escutando, em vez de deixar o JARVIS "surdo"
+                # pelo resto da sessão.
+                logger.error(f"Erro na thread de escuta (recuperando): {erro}")
+                time.sleep(0.5)
     finally:
         stream.stop_stream()
         stream.close()
         pa.terminate()
 
 
-# Loop principal (roda dentro da bandeja)
+def _supervisor_escuta(estado: EstadoAssistente, modelo_stt: WhisperModel) -> None:
+    """Reinicia a thread_escuta automaticamente se ela cair por completo
+    (ex: falha ao abrir o microfone). Sem isso, um erro fatal na
+    inicialização deixaria o JARVIS mudo pro resto da execução."""
+    while not estado.parar.is_set():
+        try:
+            thread_escuta(estado, modelo_stt)
+        except Exception as erro:
+            logger.error(f"A thread de escuta caiu inesperadamente: {erro}")
+        if estado.parar.is_set():
+            break
+        logger.info("Reiniciando a escuta em 3 segundos...")
+        time.sleep(3)
 
-def loop_principal(icone):
+
+# ======================================================================
+# Loop principal (roda dentro da bandeja)
+# ======================================================================
+
+def loop_principal(icone: pystray.Icon) -> None:
+    global _estado_global
+
     icone.visible = True
     pygame.mixer.init()
 
-    fila_comandos = queue.Queue()
-    parar_evento = threading.Event()
-    estado_confirmacao = {"aguardando": False}
+    estado = EstadoAssistente()
+    _estado_global = estado
 
-    escuta = threading.Thread(
-        target=thread_escuta, args=(fila_comandos, parar_evento, estado_confirmacao), daemon=True
-    )
+    try:
+        ollama.list()
+    except Exception as erro:
+        logger.warning(f"Não consegui confirmar que o Ollama está acessível: {erro}")
+
+    logger.info("Carregando modelo de transcrição (pode demorar na primeira vez)...")
+    modelo_stt = carregar_modelo_stt()
+
+    escuta = threading.Thread(target=_supervisor_escuta, args=(estado, modelo_stt), daemon=True)
     escuta.start()
 
-    historico = []
-    registrar_log("JARVIS iniciado.")
-    falar(f'JARVIS em espera. Diga "{PALAVRA_ATIVACAO}" pra me chamar.')
+    logger.info("JARVIS iniciado.")
+    falar(f'JARVIS em espera. Diga "{PALAVRA_ATIVACAO}" pra me chamar.', estado=estado)
 
-    while not parar_evento.is_set():
+    while not estado.parar.is_set():
         try:
-            comando = fila_comandos.get(timeout=1)
+            comando = estado.fila_comandos.get(timeout=1)
         except queue.Empty:
             continue
 
         if not comando:
-            falar("Diga.", fila_interrupcao=fila_comandos)
+            falar("Diga.", estado=estado)
+            estado.escuta_direta.set()
             try:
-                comando = fila_comandos.get(timeout=8)
+                comando = estado.fila_comandos.get(timeout=8)
             except queue.Empty:
+                comando = ""
+            finally:
+                estado.escuta_direta.clear()
+            if not comando:
                 continue
 
-        if any(palavra in comando for palavra in PALAVRAS_SAIDA):
-            falar("Até mais.")
-            registrar_log("JARVIS encerrado por comando de voz.")
-            parar_evento.set()
-            icone.stop()
-            break
+        estado.falando.set()  # pausa a wake word durante todo o processamento + fala
+        try:
+            if any(palavra in comando for palavra in PALAVRAS_SAIDA):
+                falar("Até mais.", estado=estado)
+                logger.info("JARVIS encerrado por comando de voz.")
+                estado.parar.set()
+                icone.stop()
+                break
 
-        decisao = perguntar_ao_cerebro(comando, historico)
-        nome_acao = decisao.get("acao")
+            decisao = tentar_rota_rapida(comando)
+            if decisao is not None:
+                logger.debug(f"(debug) Resolvido pela rota rápida, sem LLM: {decisao}")
+            else:
+                decisao = perguntar_ao_cerebro(comando, estado.historico)
 
-        if nome_acao in ACOES_DESTRUTIVAS:
-            if not frase_bate_com_acao_destrutiva(nome_acao, comando):
-                registrar_log(
-                    f"Ação destrutiva '{nome_acao}' bloqueada: frase '{comando}' não bate com as palavras-chave esperadas."
-                )
-                falar("Não tenho certeza que foi isso que você pediu, então não vou executar.", fila_interrupcao=fila_comandos)
-                continue
+            nome_acao = decisao.get("acao")
 
-            falar(
-                f'Tem certeza que quer que eu execute "{nome_acao}"? Diga "sim" pra confirmar.',
-                fila_interrupcao=fila_comandos,
-            )
-            estado_confirmacao["aguardando"] = True
-            try:
-                resposta = fila_comandos.get(timeout=8).strip()
-            except queue.Empty:
-                resposta = ""
-            estado_confirmacao["aguardando"] = False
+            if nome_acao in ACOES_DESTRUTIVAS:
+                if not frase_bate_com_acao_destrutiva(nome_acao, comando):
+                    logger.warning(
+                        f"Ação destrutiva '{nome_acao}' bloqueada: frase '{comando}' não bate com as palavras-chave esperadas."
+                    )
+                    falar("Não tenho certeza que foi isso que você pediu, então não vou executar.", estado=estado)
+                    continue
 
-            if resposta not in PALAVRAS_CONFIRMACAO:
-                falar("Ação cancelada.", fila_interrupcao=fila_comandos)
-                registrar_log(f"Ação destrutiva '{nome_acao}' cancelada (sem confirmação).")
-                continue
+                falar(f'Tem certeza que quer que eu execute "{nome_acao}"? Diga "sim" pra confirmar.', estado=estado)
+                estado.escuta_direta.set()
+                estado.falando.clear()  # libera a escuta pra captar a confirmação
+                try:
+                    resposta = estado.fila_comandos.get(timeout=8)
+                except queue.Empty:
+                    resposta = ""
+                finally:
+                    estado.escuta_direta.clear()
+                    estado.falando.set()
 
-            registrar_log(f"Ação destrutiva '{nome_acao}' confirmada pelo usuário.")
+                if resposta not in PALAVRAS_CONFIRMACAO:
+                    falar("Ação cancelada.", estado=estado)
+                    logger.info(f"Ação destrutiva '{nome_acao}' cancelada (sem confirmação).")
+                    continue
 
-        erro_execucao = executar_acao(decisao)
+                logger.info(f"Ação destrutiva '{nome_acao}' confirmada pelo usuário.")
 
-        if nome_acao == "dizer_hora":
-            falar(dizer_hora(), fila_interrupcao=fila_comandos)
-        elif erro_execucao:
-            falar(erro_execucao, fila_interrupcao=fila_comandos)
-        else:
-            falar(decisao.get("resposta", "Feito."), fila_interrupcao=fila_comandos)
+            erro_execucao = executar_acao(decisao)
 
-        if len(historico) > 12:
-            del historico[:2]
+            if nome_acao == "dizer_hora":
+                falar(dizer_hora(), estado=estado)
+            elif erro_execucao:
+                falar(erro_execucao, estado=estado)
+            else:
+                falar(decisao.get("resposta", "Feito."), estado=estado)
+        finally:
+            estado.falando.clear()
+
+        if len(estado.historico) > 12:
+            del estado.historico[:2]
 
 
-def encerrar_pelo_tray(icone, item):
-    registrar_log("JARVIS encerrado pela bandeja do sistema.")
+# ======================================================================
+# Bandeja do sistema
+# ======================================================================
+
+def encerrar_pelo_tray(icone: pystray.Icon, item) -> None:
+    logger.info("JARVIS encerrado pela bandeja do sistema.")
     icone.stop()
     os._exit(0)
 
 
-def criar_icone():
+def criar_icone() -> Image.Image:
     imagem = Image.new("RGB", (64, 64), "black")
     desenho = ImageDraw.Draw(imagem)
     desenho.ellipse((8, 8, 56, 56), fill="deepskyblue")
     return imagem
 
 
-def main():
+def main() -> None:
     menu = pystray.Menu(pystray.MenuItem("Encerrar JARVIS", encerrar_pelo_tray))
     icone = pystray.Icon("jarvis", criar_icone(), "JARVIS", menu)
     icone.run(setup=loop_principal)
