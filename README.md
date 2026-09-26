@@ -1,6 +1,3 @@
-JARVIS
-
-Assistente pessoal desenvolvido em Python para controlar e automatizar tarefas no computador através de comandos de voz.
 
 O JARVIS foi criado como um projeto de automação e exploração de recursos de reconhecimento de voz, execução de comandos e interação com o sistema operacional.
 
