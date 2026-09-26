@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+
+# Arquivos gerados em tempo de execução
+jarvis_fala.mp3
+jarvis_log.txt
+jarvis_memoria.json
